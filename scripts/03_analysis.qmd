@@ -1,0 +1,665 @@
+---
+title: "Differential gene expression analysis of GA0518 tumor cells"
+format: html
+---
+
+Treatments: YAP/TEAD inhibitor VT00278, YAP knockout, and untreated
+Comparisons: VT00278 vs. untreated, YAP knockout vs untreated
+
+### Load libraries
+
+```{r}
+suppressPackageStartupMessages(library(coriell))
+suppressPackageStartupMessages(library(here))
+suppressPackageStartupMessages(library(data.table))
+suppressPackageStartupMessages(library(ggplot2))
+suppressPackageStartupMessages(library(patchwork))
+suppressPackageStartupMessages(library(PCAtools))
+suppressPackageStartupMessages(library(edgeR))
+suppressPackageStartupMessages(library(quantro))
+suppressPackageStartupMessages(library(qsmooth))
+suppressPackageStartupMessages(library(fgsea))
+suppressPackageStartupMessages(library(clusterProfiler))
+suppressPackageStartupMessages(library(org.Hs.eg.db))
+suppressPackageStartupMessages(library(fgsea))
+suppressPackageStartupMessages(library(ComplexHeatmap))
+suppressPackageStartupMessages(library(tximeta))
+suppressPackageStartupMessages(library(dplyr))
+suppressPackageStartupMessages(library(msigdbr))
+suppressPackageStartupMessages(library(limma))
+suppressPackageStartupMessages(library(TMSig))
+suppressPackageStartupMessages(library(EnrichedHeatmap))
+
+theme_set(theme_coriell())
+
+figures <- here("results", "figures")
+datafiles <- here("results", "data-files")
+rdsfiles <- here("results", "rds-files") 
+
+FDR_cutoff = 0.05
+LFC = log2(1.5)
+
+w = 11
+h = 7
+
+invisible(lapply(c(figures, datafiles,rdsfiles), dir.create, showWarnings=FALSE, recursive=TRUE))
+```
+
+### Find quant files and clean metadata
+
+```{r}
+quant_files <- list.files(here("data", "02_quant"), 
+                          pattern = ".sf", full.names = TRUE, recursive = TRUE)
+coldata <- data.frame(files = quant_files)
+coldata$names <- gsub("_quants/quant.sf", "", coldata$files)
+coldata$names <- basename(coldata$names)
+
+metadata <- fread(here("data", "sample-metadata.csv"))
+coldata <- merge(coldata, metadata, by.x = "names", by.y = "sample")
+```
+
+### Setting genes of interest
+
+```{r}
+hippo_yap_tead_genes <-  c("YAP1", "TEAD1", "TEAD2", "TEAD3", "TEAD4", "CCN1", "CCN2", "SOX9")
+
+cell_cycle_checkpoints <- c(
+  "CENPT", "EMB", "CDKN2A", "CENPM", "CENPN", "CENPK", "CENPQ", 
+  "ATRIP", "NDEL1", "MAD1L1", "CLIP1", "CENPI", "PSMD2", "KNL1", 
+  "PSMB7", "SKA1", "ATM", "B9D2", "NUP107", "RAD9B", "ORC6", 
+  "MAD2L1", "NSD2", "ORC3", "CDC45", "BACH1", "UBC", "UBE2V2", 
+  "CCN1", "PSMD13", "PSMD14", "BIRC5", "SGO2", "CLSPN"
+)
+```
+
+### Import counts with tximeta
+
+```{r}
+se <- tximeta(coldata)
+gse <- summarizeToGene(se)
+gse <- addIds(gse, "SYMBOL", gene=TRUE, db = org.Hs.eg.db, multiVals = "first")
+saveRDS(gse, here(rdsfiles, "se.rds"))
+```
+
+### Save raw counts
+
+```{r}
+gse <- readRDS(here(rdsfiles, "se.rds"))
+
+raw_counts <- assay(gse, "counts")
+
+write.table(raw_counts, file=here(datafiles, "raw_counts_all_samples.txt"), row.names=TRUE, col.names=TRUE)
+```
+
+### Import as DGEList
+
+```{r}
+y <- SE2DGEList(gse)
+remove(gse)
+
+y$genes$gene_id <- sub("\\.[0-9]+$", "", y$genes$gene_id)
+```
+
+### Keep only protein coding genes
+
+```{r}
+gtf <- rtracklayer::import(here("data/gencode.v38.annotation.gtf"))
+coding <- gtf[gtf$type == "gene" & gtf$gene_type == "protein_coding", ]
+remove(gtf)
+y <- y[rownames(y$counts) %in% coding$gene_id, ]
+```
+
+### Remove the unexpressed genes
+
+```{r}
+keep <- filterByExpr(y)
+y <- y[keep,,keep.lib.sizes = FALSE]
+
+table(keep)
+```
+
+### Calculate logcounts
+
+```{r}
+logcounts <- cpm(y, log = TRUE)
+```
+
+## QC Plots
+
+### RLE boxplots
+
+```{r}
+coriell::plot_boxplot(logcounts, metadata = y$samples, fillBy = "group", rle = TRUE) + 
+  labs(title = "Relative Log Expression", 
+       x = "RLE") +
+  scale_fill_brewer(palette = "Paired")
+ggsave(here(figures, "rle-boxplot.png"), width = w, height = h)
+```
+
+### Library distributions
+
+```{r}
+coriell::plot_density(logcounts, metadata = y$samples, colBy = "group") +
+  labs(title = "Library Distributions",
+       x = "logCPM") +
+  scale_color_brewer(palette = "Paired")
+ggsave(here(figures, "library-distributions.png"), width = w, height = h)
+```
+
+### Most variable genes
+
+```{r}
+coriell::plot_parallel(logcounts, metadata = y$samples, colBy = "group", removeVar = 0.9, alpha = 0.1) +
+  labs(title = "10% Most Variable Genes",
+       y = "logCPM") +
+  scale_color_brewer(palette = "Paired")
+ggsave(here(figures, "parallel-coordinates-plot.png"), width = w, height = h)
+```
+
+### Sample vs Sample distance
+
+```{r}
+coriell::plot_dist(
+  logcounts, 
+  metadata = y$samples[, "group", drop = FALSE], 
+  main = "Sample vs Sample Distance",
+  cellwidth = 30,
+  filename = here(figures, "sample-vs-sample-distance.png")
+  )
+```
+
+### PCA
+
+```{r}
+biplot(pca(logcounts, metadata = y$samples, 
+           removeVar = 0.8), 
+      colby = "group",
+      hline = 0,
+      hlineType = 2,
+      vline = 0,
+      vlineType = 2,
+      legendPosition = "bottom",
+      caption = "20% Most Variable Genes",
+      pointSize = 5
+      ) +
+      scale_color_brewer(palette = "Paired") +
+      labs(title = paste0("PCA: ")) +
+      theme_coriell()
+ggsave(here(figures, "pca-biplot.png"), width = 12, height = 8)
+```
+
+### Heatmap
+
+```{r}
+col_df <- y$samples[, "group", drop = FALSE]
+col_df$group <- factor(col_df$group)
+trt_pal <- RColorBrewer::brewer.pal(n = nlevels(col_df$group), "Paired")
+names(trt_pal) <- levels(col_df$group)
+ann_cols <- list(group = trt_pal)
+```
+
+```{r}
+quickmap(
+  logcounts,
+  removeVar = 0.8,
+  annotation_col = col_df,
+  annotation_colors = ann_cols,
+  main = "20% Most Variable Genes",
+  filename = here(figures, "heatmap.png")
+  )
+```
+
+### Test for violations of global normalization
+
+```{r}
+doParallel::registerDoParallel(cores = 8)
+
+qtest <- quantro(y$counts, groupFactor = y$samples$group, B = 1e3)
+anova(qtest)
+quantroPvalPerm(qtest)
+```
+
+```{r}
+quantroPlot(qtest)
+ggsave(here(figures, "quantro-plot.png"), width = w, height = h)
+```
+
+### Design matrix and contrasts
+
+```{r}
+design = model.matrix(~0 + group, data = y$samples)
+colnames(design) <- gsub("group", "", colnames(design))
+
+cm <- makeContrasts(
+  GA0518.VT_200_vs_GA0518.untreated = GA0518.VT_200 - GA0518.untreated,
+  GA0518.YAP_KO_D_vs_GA0518.untreated = GA0518.YAP_KO_D - GA0518.untreated,
+ 
+  levels = design
+)
+```
+
+### Normalization
+
+```{r}
+y <- normLibSizes(y, method = "TMM")
+```
+
+```{r}
+png(here(figures, "md-plots.png"), width = w * 100, height = h * 100, res = 150)
+
+par(mfrow = c(2, 4))
+for (i in 1:ncol(y)) {
+  plotMD(cpm(y, log = TRUE), column = i)
+  abline(h = 0, lty = 2, col = "red2")
+}
+
+dev.off() 
+```
+
+### Estimate dispersion and fit
+
+```{r}
+y <- estimateDisp(y, design)
+fit <- glmQLFit(y, design)
+```
+
+### Test for differential expression
+
+```{r}
+results <- lapply(
+  colnames(cm), 
+  function(x) glmTreat(fit, 
+                       contrast = cm[, x], 
+                       lfc = LFC)
+)
+```
+
+```{r}
+results <- lapply(results, edger_to_df)
+names(results) <- colnames(cm)
+```
+
+```{r}
+result_dt <- rbindlist(results, idcol = "Contrast")
+fwrite(result_dt, 
+       here(datafiles, "dge_results.csv"), 
+       sep = ",")
+```
+
+### DE plots
+
+```{r}
+cons <- result_dt[, unique(Contrast)]
+
+v <- lapply(cons, function(x) {
+  coriell::plot_volcano(result_dt[Contrast == x], fdr = FDR_cutoff, lfc = LFC) + 
+    ggtitle(gsub("_vs_", " vs ", x)) + 
+    theme_coriell()
+  })
+m <- lapply(cons, function(x) {
+  coriell::plot_md(result_dt[Contrast == x], fdr = FDR_cutoff, lfc = LFC) + 
+    ggtitle(gsub("_vs_", " vs ", x)) + 
+    theme_coriell()
+  })
+
+v <- v
+m <- m
+```
+
+```{r}
+((v[[1]] | v[[2]])) +
+  plot_annotation(title = "All Features") +
+  plot_layout(guides = "collect") &
+  theme_coriell()
+ggsave(here(figures, "volcano-plots.png"), width =14, height = 7)
+
+((m[[1]] | m[[2]])) +
+  plot_annotation(title = "All Features") +
+  plot_layout(guides = "collect") &
+  theme_coriell()
+ggsave(here(figures, "ma-plots.png"), width = 14, height = 7)
+```
+
+```{r}
+result_dt <- result_dt |>
+  filter(FDR < FDR_cutoff) |>
+  select(c("Contrast", "feature_id", "gene_id", "SYMBOL", "logFC", "logCPM", "PValue", "FDR"))
+fwrite(result_dt, 
+       here(datafiles, paste0("DE-genes_fdr_", FDR_cutoff, ".tsv")), 
+       sep = "\t")
+```
+
+### Heatmap of DE genes
+
+```{r}
+de_lcpm <- logcounts[rownames(logcounts) %in% result_dt$feature_id, ]
+
+quickmap(
+    x = de_lcpm, 
+    annotation_col = col_df,
+    annotation_colors = ann_cols,
+    main = "Differentially Expressed Genes",
+    filename = here(figures,"heatmap_de_genes_all.png"))
+```
+
+### Heatmap of DE genes in each comparison
+
+```{r}
+for (con in cons) {
+  groups <- strsplit(con, "_vs_")[[1]]
+  metadata <- y$samples[y$samples$group %in% groups, ]
+  
+  de_genes <- result_dt |>
+    filter(Contrast == con) |>
+    select(feature_id)
+
+  de_lcpm <- de_lcpm[
+    rownames(de_lcpm) %in% de_genes$feature_id, 
+    colnames(de_lcpm) %in% rownames(metadata)
+  ]
+  
+  col_df_ <- col_df[col_df$group %in% groups, , drop = FALSE]
+  ann_cols_ <- ann_cols
+  ann_cols_$group <- ann_cols$group[names(ann_cols$group) %in% groups]
+  
+  p <- quickmap(
+    x = de_lcpm, 
+    annotation_col = col_df_,
+    annotation_colors = ann_cols_,
+    main = paste0(gsub("_", " ", con), ": Differentially Expressed Genes"))
+  
+  ggsave(
+  filename = here(figures, paste0("heatmap_de_genes_all_", con, ".png")),
+  plot = p,
+  width = 12,    
+  height = 8,    
+  dpi = 300   
+)
+}
+```
+
+### Changing rownames of lpcm to symbols
+
+```{r}
+matched_symbols <- result_dt$SYMBOL[match(rownames(de_lcpm), result_dt$feature_id)]
+
+rownames(de_lcpm) <- ifelse(is.na(matched_symbols), rownames(de_lcpm), matched_symbols)
+```
+
+### Create a function to make heatmaps based on a list of genes
+```{r}
+plot_gene_subset_heatmap <- function(genes, label, contrast_name, results_df, lcpm_data, metadata, ann_cols) {
+  groups <- strsplit(contrast_name, "_vs_")[[1]] 
+  
+  sample_metadata <- metadata[metadata$group %in% groups, ] 
+  relevant_sample_names <- sample_metadata$names
+  
+  de_subset <- results_df %>%
+    filter(Contrast == contrast_name & SYMBOL %in% genes) %>%
+    pull(SYMBOL) 
+  
+  de_lcpm <- lcpm_data[
+    rownames(lcpm_data) %in% de_subset, 
+    colnames(lcpm_data) %in% relevant_sample_names, 
+    drop = FALSE
+  ] 
+  
+  col_df <- sample_metadata[, "group", drop = FALSE] 
+
+  ann_cols_h <- ann_cols
+  ann_cols_h$group <- ann_cols_h$group[names(ann_cols_h$group) %in% groups] 
+  
+  p <- quickmap(
+    x = de_lcpm, 
+    annotation_col = col_df,
+    annotation_colors = ann_cols_h,
+    show_rownames = TRUE, 
+    main = paste0(gsub("_", " ", contrast_name), ": ", label)
+  )
+
+  safe_label <- gsub(" ", "_", label)
+  ggsave(
+    filename = here(datafiles, paste0("heatmap_de_", contrast_name, "_", safe_label, ".png")), 
+    plot = p,
+    width = 12,    
+    height = 8,    
+    dpi = 300   
+  )
+  
+  return(p)
+}
+```
+
+
+### Heatmap of Hippo/YAP TEAD signaling genes
+
+```{r}
+for (con in cons) {
+  plot_gene_subset_heatmap(genes = hippo_yap_tead_genes, 
+                         label = "Hippo/YAP TEAD Signaling Genes", 
+                         contrast_name = con, 
+                         results_df = result_dt, 
+                         lcpm_data = de_lcpm, 
+                         metadata = y$samples, 
+                         ann_cols = ann_cols)}
+```
+
+### Heatmap of cell cycle checkpoints
+
+```{r}
+for (con in cons) {
+  plot_gene_subset_heatmap(genes = cell_cycle_checkpoints, 
+                         label = "Cell Cycle Checkpoint Genes", 
+                         contrast_name = con, 
+                         results_df = result_dt, 
+                         lcpm_data = de_lcpm, 
+                         metadata = y$samples, 
+                         ann_cols = ann_cols)}
+```
+
+### Heatmap of initiation, elongation, termination genes
+
+```{r}
+pol2_initiation_vt <- c("TAF7", "CCNH", "GTF2H2", "GTF2H1", "POLR2D", "TAF9", "TAF9B", "TAF3", "TAF4B")
+pol2_elongation_vt <- c("CTDP1", "CCNH", "GTF2H2", "GTF2H1", "ELL", "POLR2D")
+pol2_termination_vt <- c("CDC40", "RBP1")
+
+plot_gene_subset_heatmap(genes = pol2_initiation_vt, 
+                         label = "Pol2 Initiation Genes", 
+                         contrast_name = "GA0518.VT_200_vs_GA0518.untreated", 
+                         results_df = result_dt, 
+                         lcpm_data = de_lcpm, 
+                         metadata = y$samples, 
+                         ann_cols = ann_cols)
+
+plot_gene_subset_heatmap(genes = pol2_elongation_vt, 
+                         label = "Pol2 Elongation Genes", 
+                         contrast_name = "GA0518.VT_200_vs_GA0518.untreated", 
+                         results_df = result_dt, 
+                         lcpm_data = de_lcpm, 
+                         metadata = y$samples, 
+                         ann_cols = ann_cols)
+
+plot_gene_subset_heatmap(genes = pol2_termination_vt, 
+                         label = "Pol2 Termination Genes", 
+                         contrast_name = "GA0518.VT_200_vs_GA0518.untreated", 
+                         results_df = result_dt, 
+                         lcpm_data = de_lcpm, 
+                         metadata = y$samples, 
+                         ann_cols = ann_cols)
+```
+
+```{r}
+pol2_initiation_yap_ko <- c("TAF3", "POLR2A")
+pol2_elongation_yap_ko <- c("CTDP1", "MLLT1", "ELL", "POLR2A", "SUPT6H")
+pol2_termination_yap_ko <- c("DHX38", "ZC3H11A", "SMG1")
+
+plot_gene_subset_heatmap(genes = pol2_initiation_yap_ko, 
+                         label = "Pol2 Initiation Genes", 
+                         contrast_name = "GA0518.YAP_KO_D_vs_GA0518.untreated", 
+                         results_df = result_dt, 
+                         lcpm_data = de_lcpm, 
+                         metadata = y$samples, 
+                         ann_cols = ann_cols)
+
+plot_gene_subset_heatmap(genes = pol2_elongation_yap_ko, 
+                         label = "Pol2 Elongation Genes", 
+                         contrast_name = "GA0518.YAP_KO_D_vs_GA0518.untreated", 
+                         results_df = result_dt, 
+                         lcpm_data = de_lcpm, 
+                         metadata = y$samples, 
+                         ann_cols = ann_cols)
+
+plot_gene_subset_heatmap(genes = pol2_termination_yap_ko, 
+                         label = "Pol2 Termination Genes", 
+                         contrast_name = "GA0518.YAP_KO_D_vs_GA0518.untreated", 
+                         results_df = result_dt, 
+                         lcpm_data = de_lcpm, 
+                         metadata = y$samples, 
+                         ann_cols = ann_cols)
+```
+
+### GO
+
+```{r}
+# universe <- unique(y$genes$gene_id)
+universe <- unique(sub("\\.[0-9]+$", "", coding$gene_id))
+doEgo <- function(x) {
+  enrichGO(
+    x,
+    OrgDb = org.Hs.eg.db,
+    universe = universe,
+    keyType = "ENSEMBL",
+    ont = "ALL",
+    pool = TRUE,
+    readable = TRUE
+    )
+}
+```
+
+Perform the GO analysis on each set
+
+```{r}
+up_genes <- lapply(results, function(x) { 
+  up <- x[x$FDR < 0.05 & x$logFC > 0, ]
+  gsub("\\.[0-9]+$", "", up$gene_id)
+  })
+
+down_genes <- lapply(results, function(x) { 
+  down <- x[x$FDR < 0.05 & x$logFC < 0, ]
+  gsub("\\.[0-9]+$", "", down$gene_id)
+  })
+
+up_go <- parallel::mclapply(up_genes, 
+                                       doEgo, 
+                                       mc.cores = length(up_genes))
+down_go <- parallel::mclapply(down_genes, 
+                                         doEgo, 
+                                         mc.cores = length(down_genes))
+```
+
+Extract as data.frames and write out to file
+
+```{r}
+up_dfs <- lapply(up_go, data.frame)
+down_dfs <- lapply(down_go, data.frame)
+
+names(up_dfs) <- paste0(names(up_dfs), ".up")
+names(down_dfs) <- paste0(names(down_dfs), ".down")
+
+up_dfs <- rbindlist(up_dfs, idcol = "Contrast.Direction")
+down_dfs <- rbindlist(down_dfs, idcol = "Contrast.Direction")
+
+ego_df <- rbind(up_dfs, down_dfs)
+setorder(ego_df, "Contrast.Direction")
+
+fwrite(ego_df, here(datafiles, "gene-ontology.tsv"), sep = "\t")
+```
+
+```{r}
+plotDotPlots <- function(x, up_go, down_go) {
+  fname <- paste0("dotplot-", x, ".png")
+  ptitle <- gsub("_vs_", " vs ", x)
+  d1 <- dotplot(up_go[[x]]) + labs(title = "Up-regulated genes")
+  d2 <- dotplot(down_go[[x]]) + labs(title = "Down-regulated genes")
+  print((d1 | d2) + plot_annotation(title = ptitle))
+  ggsave(here(figures, fname), width = 18, height = 6)
+}
+
+
+for (p in cons) plotDotPlots(p, up_go, down_go)
+```
+
+### GSEA
+
+```{r}
+msigdb_hs <- msigdbr(species = "Homo sapiens", category = "H")
+msigdb_hs <- split(as.character(msigdb_hs$db_ensembl_gene), msigdb_hs$gs_name)
+
+idx <- ids2indices(gene.sets = msigdb_hs, identifiers = unique(y$genes$gene_id))
+
+stats <- lapply(results, function(x) {
+  s <- sign(x[["logFC"]]) * -log10(x[["PValue"]])
+  names(s) <- x[["gene_id"]]
+  s
+  })
+
+doFGSEA <- function(x) fgsea(msigdb_hs, x, nPermSimple = 1e4, eps = 0.0)
+fgsea_results <- lapply(stats, doFGSEA)
+fgsea_df <- rbindlist(fgsea_results, idcol = "Contrast")
+fwrite(fgsea_df, 
+       here(datafiles, "gene-set-enrichment-hallmark.tsv"), 
+       sep="\t", sep2=c("", " ", ""))
+```
+
+### GSEA enrichment plots for gene sets of interest
+
+```{r}
+gene_sets <- c("HALLMARK_INTERFERON_ALPHA_RESPONSE",
+               "HALLMARK_INTERFERON_GAMMA_RESPONSE")
+
+for (i in seq_along(cons)) {
+  stats_vec <- stats[[cons[i]]]
+
+  for (j in seq_along(gene_sets)) {
+    gene_set_name <- gene_sets[[j]]
+    gene_set <- msigdb_hs[[gene_set_name]]
+
+    p <- plotEnrichment(gene_set, stats_vec) + 
+      ggtitle(gsub("HALLMARK_", "", gene_set_name)) + 
+    theme(plot.title = element_text(size = 12, face = "bold"))
+
+    ggsave(
+      filename = here(figures, paste0("gsea_enrichment_plot_", cons[i], "_", gene_set_name, ".png")),
+      plot = p,
+      width = 6,
+      height = 4,
+      dpi = 300
+    )
+  }
+}
+```
+
+### GSEA enrichment plots for all significant gene sets
+
+```{r}
+plotEnrichmentDotPlot <- function(x, fgsea_df) {
+  fname <- paste0("gsea-hallmark-", x, ".png")
+  fgsea_df[Contrast == cons[[x]] & padj < 0.05] |> 
+    mutate(pathway = gsub("HALLMARK_", "", pathway)) |>
+  ggplot(aes(x = NES, y = reorder(pathway, NES), size = -log10(padj), color = -log10(padj))) +
+  geom_point() +
+    geom_vline(xintercept = 0, linetype = 2) + 
+  labs(title = gsub("_vs_", " vs ", x),
+       x = "Normalized Enrichment Score",
+       y = NULL,
+       color = "-log10(FDR)") +
+  scale_color_viridis_c() +
+  guides(size = "none") +
+    theme(legend.text = element_text(size = 9), 
+          plot.title = element_text(size = 12, face = "bold"))
+  ggsave(here(figures, fname), width = 6, height = 4, dpi = 300)
+}
+
+for (p in cons) plotEnrichmentDotPlot(p, fgsea_df)
+```
