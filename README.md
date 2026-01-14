@@ -96,7 +96,11 @@ bash scripts/02_quant.sh data/01_fastp data/02_quant /path/to/salmon_index
 
 -   Creates dotplots for GSEA results and enrichment plots for specific gene sets (Interferon alpha and gamma response)
 
-**Parameters**: - FDR cutoff: 0.05 - Log-fold-change threshold: log2(1.5) ≈ 0.585
+**Parameters**:
+
+-   FDR cutoff: 0.05
+
+-   Log-fold-change threshold: log2(1.5) ≈ 0.585
 
 **Dependencies**:
 
@@ -116,8 +120,11 @@ Sample metadata is stored in `data/sample-metadata.csv` with the following colum
 
 ## Key Results
 
+-   **Raw counts**: `data/raw_counts_all_samples.txt`
 -   **Differential Expression**: Results stored in `data/dge_results.csv`
 
 ## Contact
 
-**Author**: Ayna Mammedova (amammedova\@coriell.org)
+**Bioinformatics Analysis**: Ayna Mammedova (amammedova\@coriell.org)
+
+**Experimental design**: Yanting Zhang (yzhang\@coriell.org)
